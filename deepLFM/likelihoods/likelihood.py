@@ -1,5 +1,6 @@
 import abc
 
+
 class Likelihood:
     __metaclass__ = abc.ABCMeta
 

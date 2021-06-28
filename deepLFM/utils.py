@@ -1,7 +1,10 @@
 import torch
 
+JITTER = 1e-6
+
+
 def DKL_Gaussian(m_q, lv_q, m_p, lv_p):
-    """ Returns the Kullback Leibler divergence for MV Gaussian distributions
+    """Returns the Kullback Leibler divergence for MV Gaussian distributions
         q and p with diagonal covariance matrices.
 
     :param m_q: Means for q
