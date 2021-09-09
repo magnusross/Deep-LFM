@@ -2,13 +2,28 @@ import torch
 import time
 import numpy as np
 from torch.utils.data import TensorDataset, DataLoader
+from torch.distributions import MultivariateNormal
 from deepLFM.likelihoods import Gaussian
 from deepLFM.utils import DKL_Gaussian
+from deepLFM.features import NPFeatures
+
 
 class deepLFM(torch.nn.Module):
-    def __init__(self, d_in, d_out, n_hidden_layers=1, n_lfm=2, n_rff=20, n_lf=2, mc=100,
-                 q_Omega_fixed_epochs=0, q_theta_fixed_epochs=0, local_reparam=True, feed_forward=True):
-        """ PyTorch implementation of the deep latent force model. The underlying architecture is a
+    def __init__(
+        self,
+        d_in,
+        d_out,
+        n_hidden_layers=1,
+        n_lfm=2,
+        n_rff=20,
+        n_lf=2,
+        mc=100,
+        q_Omega_fixed_epochs=0,
+        q_theta_fixed_epochs=0,
+        local_reparam=True,
+        feed_forward=True,
+    ):
+        """PyTorch implementation of the deep latent force model. The underlying architecture is a
             deep Gaussian process with random feature expansions, and in this case we derive these
             random Fourier features from an ODE1 LFM kernel.
 
@@ -34,78 +49,134 @@ class deepLFM(torch.nn.Module):
         self.q_Omega_fixed_epochs = q_Omega_fixed_epochs
         self.q_theta_fixed_epochs = q_theta_fixed_epochs
         self.q_Omega_fixed = q_Omega_fixed_epochs > 0
-        self.q_theta_fixed = q_theta_fixed_epochs > 0        
+        self.q_theta_fixed = q_theta_fixed_epochs > 0
         self.n_rff = n_rff * np.ones(n_layers, dtype=np.int32)
         self.n_lfm = n_lfm * np.ones(n_layers, dtype=np.int32)
         self.n_lf = n_lf * np.ones(n_layers, dtype=np.int32)
         self.D = d_out
         self.likelihood = Gaussian()
-        
+
         # Define Omega matrix dimensionalities for each layer
         if self.feed_forward:
-            self.d_in = np.concatenate([[d_in], self.n_lfm[:(n_layers - 1)] + d_in])
+            self.d_in = np.concatenate([[d_in], self.n_lfm[: (n_layers - 1)] + d_in])
         else:
-            self.d_in = np.concatenate([[d_in], self.n_lfm[:(n_layers - 1)]])
+            self.d_in = np.concatenate([[d_in], self.n_lfm[: (n_layers - 1)]])
         self.d_out = self.n_rff * self.n_lf
 
         # Define W matrix dimensionalites for each layer
         self.dhat_in = 2 * self.n_rff * self.n_lf
         self.dhat_out = np.concatenate([self.n_lfm[:-1], [d_out]])
-        
-        # Define the fixed standard normals used for the VAR-FIXED treatment of Omega       
+
+        # Define the fixed standard normals used for the VAR-FIXED treatment of Omega
         self.z_for_Omega_fixed = []
         for i in range(self.n_layers):
             temp = torch.randn(1, self.d_in[i], self.d_out[i], requires_grad=False)
-            self.z_for_Omega_fixed.append(temp[0, :, :])        
-        
+            self.z_for_Omega_fixed.append(temp[0, :, :])
+
         # Define parameters which govern prior over Omega & the kernel parameters; all theta parameters are
         # constrained to be positive by means of optimising the log of the parameter
-        
+
         # Define layer-wise sensitivity parameters for inner layers to weight contribution of each input/LF
-        self.rho = [torch.randn(self.d_in[i], self.n_lf[i], requires_grad=True) for i in range(self.n_hidden_layers)]
+        self.rho = [
+            torch.randn(self.d_in[i], self.n_lf[i], requires_grad=True)
+            for i in range(self.n_hidden_layers)
+        ]
 
         # Define layer-wise prior lengthscales across whole model (ARD behaviour)
-        self.theta_log_lengthscale_prior = [np.log(0.01) \
-                                            for i in range(self.n_hidden_layers)]
-        
-        # Using the prior, define layer-wise lengthscale parameters for inner layers (ARD behaviour)
-        self.theta_log_lengthscale = [(torch.ones(self.d_in[i]) *
-                                       self.theta_log_lengthscale_prior[i]).requires_grad_(True) \
-                                      for i in range(self.n_hidden_layers)]
+        self.theta_log_lengthscale_prior = [
+            np.log(1.0)
+            for i in range(self.n_hidden_layers)  # NOTE - was 0.01 in original DLFM
+        ]
 
-        # Initialise ODE1 decay (gamma) parameters which are involved in the computation of the RFRFs within the
-        # inner layers; these can differ according to the input dimension r
-        self.theta_log_decay = [torch.log(torch.ones(self.d_in[i], 1) * 0.01).requires_grad_(True) \
-                                for i in range(self.n_hidden_layers)]
+        # Using the prior, define layer-wise lengthscale parameters for inner layers (ARD behaviour)
+        self.theta_log_lengthscale = [
+            (
+                torch.ones(self.d_in[i]) * self.theta_log_lengthscale_prior[i]
+            ).requires_grad_(True)
+            for i in range(self.n_hidden_layers)
+        ]
+
+        # Initialise the lengthscales associated with the non-parametric features at each layer,
+        # with one lengthscale per input dimension
+        self.theta_log_features_lengthscale = [
+            torch.log(torch.ones(self.d_in[i], 1) * 1.0).requires_grad_(True)
+            for i in range(self.n_hidden_layers)
+        ]
 
         # Output layer parameters; these can differ according to both input dimension r and output dimension d
-        self.rho_out = torch.randn(self.d_in[-1], self.D, self.n_lf[-1], requires_grad=True)
-        self.theta_log_lengthscale_prior_out = 0.01
-        self.theta_log_lengthscale_out = (torch.ones(self.d_in[-1],
-                                                     self.D) * self.theta_log_lengthscale_prior_out).requires_grad_(True)
+        self.rho_out = torch.randn(
+            self.d_in[-1], self.D, self.n_lf[-1], requires_grad=True
+        )
+        self.theta_log_lengthscale_prior_out = np.log(1.0)
+        self.theta_log_lengthscale_out = (
+            torch.ones(self.d_in[-1], self.D) * self.theta_log_lengthscale_prior_out
+        ).requires_grad_(True)
 
-        # Output layer ODE1 decay parameters; these can differ according to both input dimension r 
-        # and output dimension d
-        self.theta_log_decay_out = torch.log(torch.ones(self.d_in[-1], self.D) * 0.01).requires_grad_(True)
+        # Initialise the output layer lengthscales associated with the non-parametric features,
+        # these can differ according to both input dimension r and output dimension d
+        self.theta_log_features_lengthscale_out = torch.log(
+            torch.ones(self.d_in[-1], self.D) * 1.0
+        ).requires_grad_(True)
 
         # Log variance parameter of output Gaussian likelihood
-        self.output_log_var = torch.tensor([-2.0], dtype=torch.float, requires_grad=True)
-        
+        self.output_log_var = torch.tensor(
+            [-2.0], dtype=torch.float, requires_grad=True
+        )
+
         # Fetch priors over Omega using the lengthscales, and W
-        self.Omega_mean_prior, self.Omega_log_var_prior = self.get_Omega_prior((self.theta_log_lengthscale +
-                                                                                   [self.theta_log_lengthscale_out]))
+        self.Omega_mean_prior, self.Omega_log_var_prior = self.get_Omega_prior(
+            (self.theta_log_lengthscale + [self.theta_log_lengthscale_out])
+        )
         self.W_mean_prior, self.W_log_var_prior = self.get_W_prior()
-        
+
         # Initialise posteriors over Omega and W
         self.Omega_mean, self.Omega_log_var = self.init_posterior_Omega()
         self.W_mean, self.W_log_var = self.init_posterior_W()
 
+        # Initialise quantities associated with the non-parametric features at each layer,
+        # such as the set of fixed inducing inputs and variables
+        self.log_alph = [
+            torch.zeros(self.d_in[i], 1, requires_grad=True)
+            for i in range(self.n_hidden_layers)
+        ] + [
+            torch.zeros(self.d_in[-1], self.D, requires_grad=True)
+        ]  # Initialised to zero as log(1.0) = 0
+        self.amp = 1.0
+        self.n_ip = 10
+        self.z = torch.linspace(
+            -2, 2, self.n_ip
+        )  # TODO - choose IP range in a better way
+
+        # TODO - should these be optimised?
+        self.u_mean = [
+            self.z[None, :].repeat(self.d_in[i], 1) for i in range(self.n_layers)
+        ]
+        self.u_cov = [
+            (
+                1e-6
+                * torch.eye(self.n_ip, requires_grad=False)
+                .unsqueeze(0)
+                .repeat(self.d_in[i], 1, 1)
+            ).requires_grad_(True)
+            for i in range(self.n_layers)
+        ]
+
+        # self.u_dist = MultivariateNormal(
+        #     1.0 * self.z, scale_tril=1e-6 * torch.eye(self.n_ip, requires_grad=False)
+        # )
+
     def get_Omega_prior(self, log_lengthscale):
-        """ 
+        """
         Define prior over Omega, given the lengthscales; prior over variance is \frac{2}{lengthscale^2}
         """
-        Omega_mean_prior = [torch.zeros(self.d_in[i], 1, requires_grad=False) for i in range(self.n_layers)]
-        Omega_log_var_prior = [np.log(2) + (-2.0 * log_lengthscale[i]) for i in range(self.n_layers)]
+        Omega_mean_prior = [
+            torch.zeros(self.d_in[i], 1, requires_grad=False)
+            for i in range(self.n_layers)
+        ]
+        Omega_log_var_prior = [
+            np.log(2) + (-2.0 * log_lengthscale[i]) for i in range(self.n_layers)
+        ]
+
         return Omega_mean_prior, Omega_log_var_prior
 
     def get_W_prior(self):
@@ -114,31 +185,41 @@ class deepLFM(torch.nn.Module):
         """
         W_mean_prior = torch.zeros(self.n_layers, requires_grad=False)
         W_log_var_prior = torch.zeros(self.n_layers, requires_grad=False)
-        return W_mean_prior, W_log_var_prior        
+        return W_mean_prior, W_log_var_prior
 
     def init_posterior_Omega(self):
-        """ 
+        """
         Initialise posterior over Omega
         """
-        mu, log_var = self.get_Omega_prior(self.theta_log_lengthscale_prior + [self.theta_log_lengthscale_prior_out])
-        Omega_mean = [(mu[i] * torch.ones(self.d_in[i], self.d_out[i])).requires_grad_(True) \
-                       for i in range(self.n_layers)]
-        Omega_log_var = [(log_var[i] * torch.ones(self.d_in[i], self.d_out[i])).requires_grad_(True) \
-                          for i in range(self.n_layers)]
+        mu, log_var = self.get_Omega_prior(
+            self.theta_log_lengthscale_prior + [self.theta_log_lengthscale_prior_out]
+        )
+        Omega_mean = [
+            (mu[i] * torch.ones(self.d_in[i], self.d_out[i])).requires_grad_(True)
+            for i in range(self.n_layers)
+        ]
+        Omega_log_var = [
+            (log_var[i] * torch.ones(self.d_in[i], self.d_out[i])).requires_grad_(True)
+            for i in range(self.n_layers)
+        ]
         return Omega_mean, Omega_log_var
 
     def init_posterior_W(self):
-        """ 
+        """
         Initialise posterior over W
         """
-        W_mean = [torch.zeros(self.dhat_in[i], self.dhat_out[i], requires_grad=True) \
-                  for i in range(self.n_layers)]
-        W_log_var = [torch.zeros(self.dhat_in[i], self.dhat_out[i], requires_grad=True) \
-                     for i in range(self.n_layers)]
+        W_mean = [
+            torch.zeros(self.dhat_in[i], self.dhat_out[i], requires_grad=True)
+            for i in range(self.n_layers)
+        ]
+        W_log_var = [
+            torch.zeros(self.dhat_in[i], self.dhat_out[i], requires_grad=True)
+            for i in range(self.n_layers)
+        ]
         return W_mean, W_log_var
 
     def get_kl(self):
-        """ 
+        """
         Compute KL divergence between priors and approximate posteriors over Omega & W
         """
         kl = 0
@@ -146,44 +227,70 @@ class deepLFM(torch.nn.Module):
         # Sum terms arising from hidden layers first
         for i in range(self.n_hidden_layers):
 
-            Omega_log_var_prior_reshaped = (self.Omega_log_var_prior[i].clone().detach().reshape(-1, 1) *
-                                             torch.ones_like(self.Omega_log_var[i]))
-            Omega_mean_prior_reshaped = self.Omega_mean_prior[i] * torch.ones_like(self.Omega_mean[i])
+            Omega_log_var_prior_reshaped = self.Omega_log_var_prior[
+                i
+            ].clone().detach().reshape(-1, 1) * torch.ones_like(self.Omega_log_var[i])
+            Omega_mean_prior_reshaped = self.Omega_mean_prior[i] * torch.ones_like(
+                self.Omega_mean[i]
+            )
 
             kl += torch.sum(Omega_log_var_prior_reshaped)
 
-            kl += DKL_Gaussian(self.Omega_mean[i], self.Omega_log_var[i],
-                               Omega_mean_prior_reshaped, Omega_log_var_prior_reshaped)
-            kl += DKL_Gaussian(self.W_mean[i], self.W_log_var[i],
-                               self.W_mean_prior[i], self.W_log_var_prior[i].reshape(-1, 1))
+            kl += DKL_Gaussian(
+                self.Omega_mean[i],
+                self.Omega_log_var[i],
+                Omega_mean_prior_reshaped,
+                Omega_log_var_prior_reshaped,
+            )
+            kl += DKL_Gaussian(
+                self.W_mean[i],
+                self.W_log_var[i],
+                self.W_mean_prior[i],
+                self.W_log_var_prior[i].reshape(-1, 1),
+            )
 
         # Deal with output layer separately due to separate treatment of different output dimensions
         for d in range(self.D):
 
-            Omega_log_var_prior_reshaped = (self.Omega_log_var_prior[-1][:, d].clone().detach().reshape(-1, 1) *
-                                             torch.ones_like(self.Omega_log_var[-1]))
-            Omega_mean_prior_reshaped = self.Omega_mean_prior[-1] * torch.ones_like(self.Omega_mean[-1])
+            Omega_log_var_prior_reshaped = self.Omega_log_var_prior[-1][
+                :, d
+            ].clone().detach().reshape(-1, 1) * torch.ones_like(self.Omega_log_var[-1])
+            Omega_mean_prior_reshaped = self.Omega_mean_prior[-1] * torch.ones_like(
+                self.Omega_mean[-1]
+            )
 
-            kl += DKL_Gaussian(self.Omega_mean[-1], self.Omega_log_var[-1],
-                               Omega_mean_prior_reshaped, Omega_log_var_prior_reshaped)
-            kl += DKL_Gaussian(self.W_mean[-1], self.W_log_var[-1],
-                               self.W_mean_prior[-1], self.W_log_var_prior[-1].reshape(-1, 1))
+            kl += DKL_Gaussian(
+                self.Omega_mean[-1],
+                self.Omega_log_var[-1],
+                Omega_mean_prior_reshaped,
+                Omega_log_var_prior_reshaped,
+            )
+            kl += DKL_Gaussian(
+                self.W_mean[-1],
+                self.W_log_var[-1],
+                self.W_mean_prior[-1],
+                self.W_log_var_prior[-1].reshape(-1, 1),
+            )
 
         return kl
 
     def sample_from_Omega(self):
-        """ 
-        Sample from Omega when computed using fixed random variables and two optimised parameters, 
+        """
+        Sample from Omega when computed using fixed random variables and two optimised parameters,
         the mean and variance of the approximating distribution (VAR-FIXED case)
         """
         Omega_from_q = []
         for i in range(self.n_layers):
-            z = self.z_for_Omega_fixed[i] * torch.ones(self.mc, self.d_in[i], self.d_out[i])
-            Omega_from_q.append((z * torch.exp(self.Omega_log_var[i] / 2)) + self.Omega_mean[i])
+            z = self.z_for_Omega_fixed[i] * torch.ones(
+                self.mc, self.d_in[i], self.d_out[i]
+            )
+            Omega_from_q.append(
+                (z * torch.exp(self.Omega_log_var[i] / 2)) + self.Omega_mean[i]
+            )
         return Omega_from_q
 
     def sample_from_W(self):
-        """ 
+        """
         Sample from approximate posterior over W
         """
         W_from_q = []
@@ -194,14 +301,18 @@ class deepLFM(torch.nn.Module):
         return W_from_q
 
     def get_ell(self, X, y=None, ignore_nan=False):
-        """ 
+        """
         Compute expected log-likelihood term in variational lower bound
         """
         try:
             test_N = self.N
         except:
-            raise Exception(('If using the model.get_ell() function outside of training, manually supply a N value' \
-                             ' using model.N = some_value'))
+            raise Exception(
+                (
+                    "If using the model.get_ell() function outside of training, manually supply a N value"
+                    " using model.N = some_value"
+                )
+            )
 
         d_input = self.d_in[0]
         batch_size = X.size()[0]
@@ -220,34 +331,53 @@ class deepLFM(torch.nn.Module):
             # If any other layer besides the final/output layer
             if i < (self.n_layers - 1):
 
-                # Transform input to be of shape (d_input x self.mc x batch_size x 1), expand Omega 
-                # samples to same shape, and multiply together
-                layer = torch.transpose(torch.unsqueeze(self.layer[i], 0), 0, -1) 
-                Omega = torch.unsqueeze(Omega_from_q[i], -1).permute(1, 0, 3, 2).repeat(1, 1, batch_size, 1)
-                layer_Omega = Omega * layer
+                # Iterate over input dimension, filling the matrix of non-parametric features
+                # (TODO - slow solution, need to rewrite)
+                features = torch.zeros(
+                    self.d_in[i], self.mc, batch_size, self.d_out[i], dtype=torch.cfloat
+                )
+                for r in range(self.d_in[i]):
 
-                # Convert some quantities needed for kernel to complex tensor format
-                layer_Omega_c = layer_Omega.type(torch.cfloat)
-                Omega_c = Omega.type(torch.cfloat)
-                layer_c = layer.type(torch.cfloat)
+                    # Fetch layer values & frequencies for this input dim.
+                    layer_r = self.layer[i][:, :, r]
+                    Omega_r = Omega_from_q[i][:, r, :]
 
-                # Define 0 + 1*i as a variable for convenience whilst computing kernels
-                imag_1 = torch.zeros(1, dtype=torch.cfloat)  # i.e. 0 + 1i
-                imag_1.imag = torch.tensor([1.0])
-                   
-                # Fetch decay hyperparameters and convert to complex tensor form
-                gamma = torch.exp(self.theta_log_decay[i]).unsqueeze(-1).unsqueeze(-1).type(torch.cfloat)
+                    u_dist = MultivariateNormal(
+                        self.u_mean[i][r, :],
+                        scale_tril=self.u_cov[i][r, :, :],
+                    )
+                    feature_sampler = NPFeatures(
+                        u_dist,
+                        self.z,
+                        alph=torch.exp(self.log_alph[i][r, 0]),
+                        ls=torch.exp(self.theta_log_features_lengthscale[i][r, 0]),
+                        amp=self.amp,
+                        Nbasis=self.n_rff[i],
+                        Ns=self.mc,
+                    )
 
-                # Compute random features for ODE1 kernel, for all input dimensions
-                B = 1.0 / (gamma + (imag_1 * Omega_c))
-                A = - B
-
-                features = ((B * torch.exp(imag_1 * layer_Omega_c)) +
-                            (A * torch.exp(- gamma * layer_c)))
+                    # feature_sampler = NPFeatures(
+                    #     self.u_dist,
+                    #     self.z,
+                    #     alph=torch.exp(self.log_alph[i][r, 0]),
+                    #     ls=torch.exp(self.theta_log_features_lengthscale[i][r, 0]),
+                    #     amp=self.amp,
+                    #     Nbasis=self.n_rff[i],
+                    #     Ns=self.mc,
+                    # )
+                    features[r, :, :, :] = feature_sampler.sample_features(
+                        layer_r, Omega_r, self.z, self.mc
+                    )
 
                 # Construct matrix of coefficients to multiply RFs by (small epsilon to avoid NaNs in backprop)
-                v_coeff = torch.sqrt((torch.square(self.rho[i]) + 1e-7) / (self.n_lf[i] * self.n_rff[i]))
-                v_coeff = v_coeff.unsqueeze(1).unsqueeze(1).repeat_interleave(self.n_rff[i], dim=-1)
+                v_coeff = torch.sqrt(
+                    (torch.square(self.rho[i]) + 1e-7) / (self.n_lf[i] * self.n_rff[i])
+                )
+                v_coeff = (
+                    v_coeff.unsqueeze(1)
+                    .unsqueeze(1)
+                    .repeat_interleave(self.n_rff[i], dim=-1)
+                )
                 features *= v_coeff
 
                 # Construct composite kernel by combining RFRFs from each input dimension via addition
@@ -258,9 +388,13 @@ class deepLFM(torch.nn.Module):
 
                 # Compute F using reparameterisation trick (with small epsilon added to avoid NaNs in backprop)
                 if self.local_reparam:
-                    z_for_F_sample = torch.randn(self.mc, Phi.size()[1], self.dhat_out[i])
+                    z_for_F_sample = torch.randn(
+                        self.mc, Phi.size()[1], self.dhat_out[i]
+                    )
                     F_mean = torch.tensordot(Phi, self.W_mean[i], [[2], [0]])
-                    F_var = torch.tensordot(torch.pow(Phi, 2), torch.exp(self.W_log_var[i]), [[2], [0]])
+                    F_var = torch.tensordot(
+                        torch.pow(Phi, 2), torch.exp(self.W_log_var[i]), [[2], [0]]
+                    )
                     F = (z_for_F_sample * torch.sqrt(F_var + 1e-7)) + F_mean
                 # Otherwise compute samples conventionally
                 else:
@@ -282,34 +416,61 @@ class deepLFM(torch.nn.Module):
                 # Loop through each of the D outputs
                 for d in range(self.D):
 
-                    # Transform input to be of shape (d_input x self.mc x batch_size x 1), expand Omega 
-                    # samples to same shape, and multiply together
-                    layer = torch.transpose(torch.unsqueeze(self.layer[i], 0), 0, -1) 
-                    Omega = torch.unsqueeze(Omega_from_q[i], -1).permute(1, 0, 3, 2).repeat(1, 1, batch_size, 1)
-                    layer_Omega = Omega * layer
+                    # Iterate over input dimension, filling the matrix of non-parametric features
+                    # (TODO - slow solution, need to rewrite)
+                    features = torch.zeros(
+                        self.d_in[i],
+                        self.mc,
+                        batch_size,
+                        self.d_out[i],
+                        dtype=torch.cfloat,
+                    )
+                    for r in range(self.d_in[i]):
 
-                    # Convert some quantities needed for kernel to complex tensor format
-                    layer_Omega_c = layer_Omega.type(torch.cfloat)
-                    Omega_c = Omega.type(torch.cfloat)
-                    layer_c = layer.type(torch.cfloat)
+                        # Fetch layer values & frequencies for this input dim.
+                        layer_r = self.layer[i][:, :, r]
+                        Omega_r = Omega_from_q[i][:, r, :]
 
-                    # Define 0 + 1*i as a variable for convenience whilst computing kernels
-                    imag_1 = torch.zeros(1, dtype=torch.cfloat)  # i.e. 0 + 1i
-                    imag_1.imag = torch.tensor([1.0])
+                        print(self.u_mean[i][r, :].shape)
+                        print(self.u_cov[i][r, :, :].shape)
+                        print()
+                        u_dist = MultivariateNormal(
+                            self.u_mean[i][r, :],
+                            scale_tril=self.u_cov[i][r, :, :],
+                        )
+                        feature_sampler = NPFeatures(
+                            u_dist,
+                            self.z,
+                            alph=torch.exp(self.log_alph[i][r, 0]),
+                            ls=torch.exp(self.theta_log_features_lengthscale[i][r, 0]),
+                            amp=self.amp,
+                            Nbasis=self.n_rff[i],
+                            Ns=self.mc,
+                        )
 
-                    # Fetch decay hyperparameters and convert to complex tensor form
-                    gamma = torch.exp(self.theta_log_decay_out[:, d]).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).type(torch.cfloat)
-
-                    # Compute features for ODE1 kernel, for all input dimensions
-                    B = 1.0 / (gamma + (imag_1 * Omega_c))
-                    A = - B
-
-                    features = ((B * torch.exp(imag_1 * layer_Omega_c)) +
-                            (A * torch.exp(- gamma * layer_c)))
+                        # feature_sampler = NPFeatures(
+                        #     self.u_dist,
+                        #     self.z,
+                        #     alph=torch.exp(self.log_alph[i][r, d]),
+                        #     ls=torch.exp(self.theta_log_features_lengthscale_out[r, d]),
+                        #     amp=self.amp,
+                        #     Nbasis=self.n_rff[i],
+                        #     Ns=self.mc,
+                        # )
+                        features[r, :, :, :] = feature_sampler.sample_features(
+                            layer_r, Omega_r, self.z, self.mc
+                        )
 
                     # Construct matrix of coefficients to multiply RFs by (small epsilon to avoid NaNs in backprop)
-                    v_coeff = torch.sqrt((torch.square(self.rho_out[:, d, :]) + 1e-7) / (self.n_lf[i] * self.n_rff[i]))
-                    v_coeff = v_coeff.unsqueeze(1).unsqueeze(1).repeat_interleave(self.n_rff[i], dim=-1)
+                    v_coeff = torch.sqrt(
+                        (torch.square(self.rho_out[:, d, :]) + 1e-7)
+                        / (self.n_lf[i] * self.n_rff[i])
+                    )
+                    v_coeff = (
+                        v_coeff.unsqueeze(1)
+                        .unsqueeze(1)
+                        .repeat_interleave(self.n_rff[i], dim=-1)
+                    )
                     features *= v_coeff
 
                     # Construct composite kernel by combining RFRFs from each input dimension via addition
@@ -321,14 +482,21 @@ class deepLFM(torch.nn.Module):
                     # Compute y_d using reparameterisation trick (with small epsilon added to avoid NaNs in backprop)
                     if self.local_reparam:
                         z_for_y_sample = torch.randn(self.mc, Phi.size()[1], 1)
-                        y_d_mean = torch.tensordot(Phi, torch.unsqueeze(self.W_mean[i][:, d], 1), [[2], [0]])
-                        y_d_var = torch.tensordot(torch.pow(Phi, 2),
-                                                  torch.exp(torch.unsqueeze(self.W_log_var[i][:, d], 1)), [[2], [0]])
+                        y_d_mean = torch.tensordot(
+                            Phi, torch.unsqueeze(self.W_mean[i][:, d], 1), [[2], [0]]
+                        )
+                        y_d_var = torch.tensordot(
+                            torch.pow(Phi, 2),
+                            torch.exp(torch.unsqueeze(self.W_log_var[i][:, d], 1)),
+                            [[2], [0]],
+                        )
                         y_d = (z_for_y_sample * torch.sqrt(y_d_var + 1e-7)) + y_d_mean
                     # Otherwise compute samples conventionally for the d-th output
                     else:
                         W_from_q = self.sample_from_W()
-                        y_d = torch.matmul(Phi, torch.unsqueeze(W_from_q[i][:, :, d], 2))
+                        y_d = torch.matmul(
+                            Phi, torch.unsqueeze(W_from_q[i][:, :, d], 2)
+                        )
 
                     # Store these output values and proceed onto the next
                     if outputs is None:
@@ -355,9 +523,11 @@ class deepLFM(torch.nn.Module):
                     is_nan = torch.isnan(y_d)
                     y_d = y_d[~is_nan]
                     output_d = output_d[:, ~is_nan]
-                
+
                     # Compute ELL of non-NaN data-points in batch
-                    ll = self.likelihood.log_cond_prob(y_d, output_d, self.output_log_var)
+                    ll = self.likelihood.log_cond_prob(
+                        y_d, output_d, self.output_log_var
+                    )
                     ell += torch.sum(torch.logsumexp(ll, 0)) * self.N / len(y_d)
                     # ell += torch.sum(torch.mean(ll, 0)) * self.N / len(y_d)
 
@@ -372,7 +542,7 @@ class deepLFM(torch.nn.Module):
             return output_layer
 
     def get_nelbo(self, X, y, ignore_nan=False):
-        """ 
+        """
         Get negative ELBO; minimising NELBO == maximising ELBO
         """
         kl = self.get_kl()
@@ -381,13 +551,15 @@ class deepLFM(torch.nn.Module):
         return nelbo, kl, ell, output_layer
 
     def predict(self, X, y=None, get_layers=False):
-        """ 
+        """
         Generate predictions for given data
         """
         with torch.no_grad():
             output_layer = self.get_ell(X)
             output = self.likelihood.predict(output_layer)
-        y_pred_mean = torch.mean(output, 0) #+ (torch.exp(self.output_log_var / 2.0) *  torch.randn(output.size()[1], 1))
+        y_pred_mean = torch.mean(
+            output, 0
+        )  # + (torch.exp(self.output_log_var / 2.0) *  torch.randn(output.size()[1], 1))
         y_pred_std = torch.std(output, 0)
 
         # Compute MNLL, NMSE & NLPD if target values specified
@@ -395,10 +567,19 @@ class deepLFM(torch.nn.Module):
             metrics = {}
 
             # Compute mean negative log likelihood, normalised MSE and RMSE
-            mnll = - torch.mean(-np.log(self.mc) + torch.logsumexp(self.likelihood.log_cond_prob(y, output_layer, self.output_log_var), 0))
-            metrics['mnll'] = mnll.item()
-            metrics['nmse'] = (torch.mean((y_pred_mean - y)**2) / torch.mean((torch.mean(y) - y)**2)).item()
-            metrics['rmse'] = torch.sqrt(torch.mean((y_pred_mean - y)**2)).item()
+            mnll = -torch.mean(
+                -np.log(self.mc)
+                + torch.logsumexp(
+                    self.likelihood.log_cond_prob(y, output_layer, self.output_log_var),
+                    0,
+                )
+            )
+            metrics["mnll"] = mnll.item()
+            metrics["nmse"] = (
+                torch.mean((y_pred_mean - y) ** 2)
+                / torch.mean((torch.mean(y) - y) ** 2)
+            ).item()
+            metrics["rmse"] = torch.sqrt(torch.mean((y_pred_mean - y) ** 2)).item()
 
         # Fetch values at each layer as well as overall predictions
         if get_layers:
@@ -415,41 +596,64 @@ class deepLFM(torch.nn.Module):
             return y_pred_mean, y_pred_std
 
     def set_opt_vars(self):
-        """ 
-        Set variables to be optimised. Note that whilst we can treat Omega and W variationally 
+        """
+        Set variables to be optimised. Note that whilst we can treat Omega and W variationally
         within this model, the other covariance parameters are simply optimised for now.
         """
         # Initial case, Omega and theta fixed
         opt_vars = self.W_mean + self.W_log_var
         opt_vars.append(self.output_log_var)
 
+        # TODO- optimise here or with other theta stuff? Or not at all?
+        opt_vars += self.u_mean + self.u_cov
+
         # Omega fixed
         if self.q_Omega_fixed and (not self.q_theta_fixed):
-            opt_vars += (self.theta_log_lengthscale + self.rho)
+            opt_vars += self.theta_log_lengthscale + self.rho
             opt_vars.append(self.rho_out)
             opt_vars.append(self.theta_log_lengthscale_out)
 
-            opt_vars += self.theta_log_decay
-            opt_vars.append(self.theta_log_decay_out)
+            opt_vars += self.theta_log_features_lengthscale
+            opt_vars.append(self.theta_log_features_lengthscale_out)
+            opt_vars += self.log_alph  # TODO - check this is to be optimised
 
         # Theta fixed
         elif self.q_theta_fixed and (not self.q_Omega_fixed):
-            opt_vars += (self.Omega_mean + self.Omega_log_var)
+            opt_vars += self.Omega_mean + self.Omega_log_var
 
         # Nothing fixed:
         elif (not self.q_theta_fixed) and (not self.q_Omega_fixed):
-            opt_vars += (self.Omega_mean + self.Omega_log_var + self.theta_log_lengthscale + self.rho)
+            opt_vars += (
+                self.Omega_mean
+                + self.Omega_log_var
+                + self.theta_log_lengthscale
+                + self.rho
+            )
             opt_vars.append(self.rho_out)
             opt_vars.append(self.theta_log_lengthscale_out)
 
-            opt_vars += self.theta_log_decay
-            opt_vars.append(self.theta_log_decay_out)
+            opt_vars += self.theta_log_features_lengthscale
+            opt_vars.append(self.theta_log_features_lengthscale_out)
+            opt_vars += self.log_alph  # TODO - check this is to be optimised
 
         return opt_vars
 
-    def train(self, X, y, X_valid=None, y_valid=None, lr=0.01, batch_size=64, epochs=10, verbosity=1,
-              single_mc_epochs=0, train_time_limit=None, ignore_nan=False, csv_output=False):
-        """ Optimisation of the deep LFM. Using a value > 0 for single_mc_epochs (as well
+    def train(
+        self,
+        X,
+        y,
+        X_valid=None,
+        y_valid=None,
+        lr=0.01,
+        batch_size=64,
+        epochs=10,
+        verbosity=1,
+        single_mc_epochs=0,
+        train_time_limit=None,
+        ignore_nan=False,
+        csv_output=False,
+    ):
+        """Optimisation of the deep LFM. Using a value > 0 for single_mc_epochs (as well
             as fixing theta and Omega for a number of epochs) can be beneficial if training
             happens to be unstable.
 
@@ -476,9 +680,11 @@ class deepLFM(torch.nn.Module):
         optimizer = torch.optim.AdamW(self.set_opt_vars(), lr=lr)
 
         # Initialise dataloader for minibatch training
-        self.N = X.size()[0] # Total number of training examples
+        self.N = X.size()[0]  # Total number of training examples
         train_dataset = torch.utils.data.TensorDataset(X, y)
-        train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True
+        )
 
         # If desired, fix number of Monte Carlo samples to one for first 'single_mc_epochs' of training
         if single_mc_epochs != 0:
@@ -486,14 +692,14 @@ class deepLFM(torch.nn.Module):
             self.mc = 1
 
         if csv_output:
-            print('Epoch, Time, NMSE, RMSE, MNLL')
-        
+            print("Epoch, Time, NMSE, RMSE, MNLL")
+
         # Perform epochs of minibatch training
         for i in range(epochs):
 
             # Stop training after time limit elapsed
             if train_time_limit is not None:
-                if (train_time > 1000 * 60 * train_time_limit):
+                if train_time > 1000 * 60 * train_time_limit:
                     break
 
             # If given number of epochs have passed, transition to using more than one MC sample
@@ -506,11 +712,13 @@ class deepLFM(torch.nn.Module):
 
             for X_minibatch, y_minibatch in train_dataloader:
                 optimizer.zero_grad()
-                loss, _, _, _ = self.get_nelbo(X_minibatch, y_minibatch, ignore_nan=ignore_nan)
+                loss, _, _, _ = self.get_nelbo(
+                    X_minibatch, y_minibatch, ignore_nan=ignore_nan
+                )
                 loss.backward()
                 optimizer.step()
 
-            train_time += (int(round(time.time() * 1000)) - batch_start)
+            train_time += int(round(time.time() * 1000)) - batch_start
 
             # Unfix Omega/theta if sufficient number of iterations passed
             if self.q_Omega_fixed:
@@ -525,12 +733,26 @@ class deepLFM(torch.nn.Module):
 
             # Display validation metrics at specified intervals
             if verbosity == 0:
-                print('Epoch %d complete.' % i)
+                print("Epoch %d complete." % i)
             elif i % verbosity == 0:
                 with torch.no_grad():
                     _, _, metrics = self.predict(X_valid, y_valid)
-                if csv_output: # If .csv output style required for analysis of training metrics
-                    print('%d,%.4f,%.4f,%.4f,%.4f' % (i, train_time / 1000, metrics['nmse'], metrics['rmse'], metrics['mnll']))
-                else: # Otherwise, print metrics in an easily readable fashion
-                    print('Epoch %d' % (i))
-                    print('Validation N-MSE = %.4f, Validation RMSE = %.4f, Validation MNLL = %.4f\n' % (metrics['nmse'], metrics['rmse'], metrics['mnll']))
+                if (
+                    csv_output
+                ):  # If .csv output style required for analysis of training metrics
+                    print(
+                        "%d,%.4f,%.4f,%.4f,%.4f"
+                        % (
+                            i,
+                            train_time / 1000,
+                            metrics["nmse"],
+                            metrics["rmse"],
+                            metrics["mnll"],
+                        )
+                    )
+                else:  # Otherwise, print metrics in an easily readable fashion
+                    print("Epoch %d" % (i))
+                    print(
+                        "Validation N-MSE = %.4f, Validation RMSE = %.4f, Validation MNLL = %.4f\n"
+                        % (metrics["nmse"], metrics["rmse"], metrics["mnll"])
+                    )

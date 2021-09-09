@@ -66,7 +66,8 @@ class NPFeatures:
         self.z = z
         self.alph = alph
         self.ls = ls
-        self.amp = 1.0
+        self.p = 1.0 / (2.0 * self.ls ** 2)
+        self.amp = amp
         self.Nbasis = Nbasis
         self.Ns = Ns
         self.set_K()
@@ -125,7 +126,6 @@ class NPFeatures:
         # these are for the ouput not ips
         # reuqired cos function is vectorised over samples
         phis = self.compute_Phi(thets, betas, ws, ts=ts)
-        print(phis.shape)
         K, _ = self.compute_K(t1s=ts, t2s=self.z)
 
         basis_part = qs.squeeze(-1).matmul(K.T)
@@ -133,7 +133,7 @@ class NPFeatures:
         random_part = torch.sum(rws * phis, 1)
         return torch.exp(-self.alph * ts[None, :] ** 2) * (basis_part + random_part)
 
-    def sample_features(self, ts, omegas, Ns):
+    def sample_features(self, ts, omegas, z, Ns):
         """
         for now we say that for each omega sample we also sample from the filter
         omegas = Nrff
@@ -141,6 +141,29 @@ class NPFeatures:
         """
         # Nt x Ns (Ns = Nb x Nq)
         thets, betas, ws = self.sample_basis(Ns=Ns)
-        # qs = self.compute_q(thets, betas, ws)
+        qs = self.compute_q(thets, betas, ws)
+        Nt = ts.shape[1]  # 0 is the MC sample dim, 1 is num. points
+        Nz = z.shape[0]
 
-        # mI1 = I1(ts[None, None, :])
+        mI1 = I1(
+            ts[:, None, :],
+            self.alph,
+            thets[:, :, None].repeat(1, 1, Nt),
+            betas[:, :, None].repeat(1, 1, Nt),
+            omegas[:, :, None],
+        )
+        random_part = (mI1 * ws[:, :, None].repeat(1, 1, Nt)).sum(
+            axis=1, keepdim=True
+        )  # TODO - keep or remove sum?
+
+        basis_part = qs[:, 0, :].unsqueeze(1) * I2(
+            ts[:, None, :], self.alph, z[0], self.p, omegas[:, :, None]
+        )
+        for i in range(1, Nz):
+            basis_part += qs[:, i, :].unsqueeze(1) * I2(
+                ts[:, None, :], self.alph, z[i], self.p, omegas[:, :, None]
+            )
+
+        return torch.exp(-self.alph * ts[:, :, None] ** 2) * (
+            random_part + basis_part
+        ).transpose(1, 2)
