@@ -74,7 +74,7 @@ dlfm = deepLFM(
     d_in=1,
     d_out=1,
     n_hidden_layers=1,
-    n_lfm=2,  # NOTE - was 3
+    n_lfm=1,  # NOTE - was 3
     n_rff=48,  # NOTE - was 98
     n_lf=1,
     mc=49,  # NOTE - was 99
@@ -94,7 +94,7 @@ dlfm.train(
     batch_size=256,
     verbosity=10,
     single_mc_epochs=25,
-    train_time_limit=4,
+    train_time_limit=1,
 )
 
 

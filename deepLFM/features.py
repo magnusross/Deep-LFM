@@ -59,9 +59,7 @@ def I2(
 
 
 class NPFeatures:
-    def __init__(self, u_dist, z, alph, ls, amp, Nbasis, Ns):
-        self.u_dist = u_dist
-        self.Nu = u_dist.sample().shape[0]
+    def __init__(self, Nu, z, alph, ls, amp, Nbasis, Ns):
 
         self.z = z
         self.alph = torch.tensor(alph)
@@ -71,6 +69,14 @@ class NPFeatures:
         self.Nbasis = Nbasis
         self.Ns = Ns
         self.set_K()
+
+        mu = (
+            torch.distributions.MultivariateNormal(torch.zeros(Nu), self.K)
+            .rsample()
+            .requires_grad_(True)
+        )
+        cov = (0.8 * self.K).requires_grad_(True)
+        self.u_dist = torch.distributions.MultivariateNormal(mu, cov)
 
     def compute_K(self, t1s=None, t2s=None):
         if t1s is None and t2s is None:

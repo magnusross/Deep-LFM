@@ -96,13 +96,6 @@ class deepLFM(torch.nn.Module):
             for i in range(self.n_hidden_layers)
         ]
 
-        # Initialise the lengthscales associated with the non-parametric features at each layer,
-        # with one lengthscale per input dimension
-        self.theta_log_features_lengthscale = [
-            torch.log(torch.ones(self.d_in[i], 1) * 1.0).requires_grad_(True)
-            for i in range(self.n_hidden_layers)
-        ]
-
         # Output layer parameters; these can differ according to both input dimension r and output dimension d
         self.rho_out = torch.randn(
             self.d_in[-1], self.D, self.n_lf[-1], requires_grad=True
@@ -110,12 +103,6 @@ class deepLFM(torch.nn.Module):
         self.theta_log_lengthscale_prior_out = np.log(1.0)
         self.theta_log_lengthscale_out = (
             torch.ones(self.d_in[-1], self.D) * self.theta_log_lengthscale_prior_out
-        ).requires_grad_(True)
-
-        # Initialise the output layer lengthscales associated with the non-parametric features,
-        # these can differ according to both input dimension r and output dimension d
-        self.theta_log_features_lengthscale_out = torch.log(
-            torch.ones(self.d_in[-1], self.D) * 1.0
         ).requires_grad_(True)
 
         # Log variance parameter of output Gaussian likelihood
@@ -135,35 +122,26 @@ class deepLFM(torch.nn.Module):
 
         # Initialise quantities associated with the non-parametric features at each layer,
         # such as the set of fixed inducing inputs and variables
-        self.log_alph = [
-            torch.zeros(self.d_in[i], 1, requires_grad=True)
-            for i in range(self.n_hidden_layers)
-        ] + [
-            torch.zeros(self.d_in[-1], self.D, requires_grad=True)
-        ]  # Initialised to zero as log(1.0) = 0
+        self.alph = 1.0  # TODO - fix this to specific value later?
         self.amp = 1.0
-        self.n_ip = 10
+        self.Nu = 10
         self.z = torch.linspace(
-            -2, 2, self.n_ip
+            -2, 2, self.Nu
         )  # TODO - choose IP range in a better way
 
-        # TODO - should these be optimised?
-        self.u_mean = [
-            self.z[None, :].repeat(self.d_in[i], 1) for i in range(self.n_layers)
-        ]
-        self.u_cov = [
-            (
-                1e-6
-                * torch.eye(self.n_ip, requires_grad=False)
-                .unsqueeze(0)
-                .repeat(self.d_in[i], 1, 1)
-            ).requires_grad_(True)
-            for i in range(self.n_layers)
-        ]
+        self.theta_log_features_lengthscale = torch.log(
+            torch.tensor([1.0])
+        ).requires_grad_(True)
 
-        # self.u_dist = MultivariateNormal(
-        #     1.0 * self.z, scale_tril=1e-6 * torch.eye(self.n_ip, requires_grad=False)
-        # )
+        self.features = NPFeatures(
+            self.Nu,
+            self.z,
+            alph=self.alph,
+            ls=torch.exp(self.theta_log_features_lengthscale),
+            amp=self.amp,
+            Nbasis=self.n_rff[i],
+            Ns=self.mc,
+        )
 
     def get_Omega_prior(self, log_lengthscale):
         """
@@ -342,29 +320,6 @@ class deepLFM(torch.nn.Module):
                     layer_r = self.layer[i][:, :, r]
                     Omega_r = Omega_from_q[i][:, r, :]
 
-                    u_dist = MultivariateNormal(
-                        self.u_mean[i][r, :],
-                        scale_tril=self.u_cov[i][r, :, :],
-                    )
-                    feature_sampler = NPFeatures(
-                        u_dist,
-                        self.z,
-                        alph=torch.exp(self.log_alph[i][r, 0]),
-                        ls=torch.exp(self.theta_log_features_lengthscale[i][r, 0]),
-                        amp=self.amp,
-                        Nbasis=self.n_rff[i],
-                        Ns=self.mc,
-                    )
-
-                    # feature_sampler = NPFeatures(
-                    #     self.u_dist,
-                    #     self.z,
-                    #     alph=torch.exp(self.log_alph[i][r, 0]),
-                    #     ls=torch.exp(self.theta_log_features_lengthscale[i][r, 0]),
-                    #     amp=self.amp,
-                    #     Nbasis=self.n_rff[i],
-                    #     Ns=self.mc,
-                    # )
                     features[r, :, :, :] = feature_sampler.sample_features(
                         layer_r, Omega_r, self.z, self.mc
                     )
@@ -431,32 +386,6 @@ class deepLFM(torch.nn.Module):
                         layer_r = self.layer[i][:, :, r]
                         Omega_r = Omega_from_q[i][:, r, :]
 
-                        print(self.u_mean[i][r, :].shape)
-                        print(self.u_cov[i][r, :, :].shape)
-                        print()
-                        u_dist = MultivariateNormal(
-                            self.u_mean[i][r, :],
-                            scale_tril=self.u_cov[i][r, :, :],
-                        )
-                        feature_sampler = NPFeatures(
-                            u_dist,
-                            self.z,
-                            alph=torch.exp(self.log_alph[i][r, 0]),
-                            ls=torch.exp(self.theta_log_features_lengthscale[i][r, 0]),
-                            amp=self.amp,
-                            Nbasis=self.n_rff[i],
-                            Ns=self.mc,
-                        )
-
-                        # feature_sampler = NPFeatures(
-                        #     self.u_dist,
-                        #     self.z,
-                        #     alph=torch.exp(self.log_alph[i][r, d]),
-                        #     ls=torch.exp(self.theta_log_features_lengthscale_out[r, d]),
-                        #     amp=self.amp,
-                        #     Nbasis=self.n_rff[i],
-                        #     Ns=self.mc,
-                        # )
                         features[r, :, :, :] = feature_sampler.sample_features(
                             layer_r, Omega_r, self.z, self.mc
                         )
@@ -605,7 +534,7 @@ class deepLFM(torch.nn.Module):
         opt_vars.append(self.output_log_var)
 
         # TODO- optimise here or with other theta stuff? Or not at all?
-        opt_vars += self.u_mean + self.u_cov
+        opt_vars += self.features.u_dist.mean + self.features.u_dist.covariance_matrix
 
         # Omega fixed
         if self.q_Omega_fixed and (not self.q_theta_fixed):
@@ -615,7 +544,6 @@ class deepLFM(torch.nn.Module):
 
             opt_vars += self.theta_log_features_lengthscale
             opt_vars.append(self.theta_log_features_lengthscale_out)
-            opt_vars += self.log_alph  # TODO - check this is to be optimised
 
         # Theta fixed
         elif self.q_theta_fixed and (not self.q_Omega_fixed):
@@ -634,7 +562,6 @@ class deepLFM(torch.nn.Module):
 
             opt_vars += self.theta_log_features_lengthscale
             opt_vars.append(self.theta_log_features_lengthscale_out)
-            opt_vars += self.log_alph  # TODO - check this is to be optimised
 
         return opt_vars
 
