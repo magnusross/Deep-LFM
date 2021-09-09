@@ -64,10 +64,10 @@ class NPFeatures:
         self.Nu = u_dist.sample().shape[0]
 
         self.z = z
-        self.alph = alph
-        self.ls = ls
+        self.alph = torch.tensor(alph)
+        self.ls = torch.tensor(ls)
         self.p = 1.0 / (2.0 * self.ls ** 2)
-        self.amp = amp
+        self.amp = torch.tensor(amp)
         self.Nbasis = Nbasis
         self.Ns = Ns
         self.set_K()
@@ -118,7 +118,7 @@ class NPFeatures:
         us = self.u_dist.rsample(sample_shape=(self.Ns,))
         rLK = self.LK.unsqueeze(0).repeat(self.Ns, 1, 1)
         x = us.unsqueeze(-1) - phi.transpose(1, 2).matmul(ws.unsqueeze(-1))
-        return torch.cholesky_solve(x, rLK)
+        return torch.cholesky_solve(x, rLK).squeeze(-1)
 
     def sample_G(self, ts):
         thets, betas, ws = self.sample_basis()
@@ -128,12 +128,12 @@ class NPFeatures:
         phis = self.compute_Phi(thets, betas, ws, ts=ts)
         K, _ = self.compute_K(t1s=ts, t2s=self.z)
 
-        basis_part = qs.squeeze(-1).matmul(K.T)
+        basis_part = qs.matmul(K.T)
         rws = ws.unsqueeze(-1).repeat(1, 1, ts.shape[0])
         random_part = torch.sum(rws * phis, 1)
         return torch.exp(-self.alph * ts[None, :] ** 2) * (basis_part + random_part)
 
-    def sample_features(self, ts, omegas, z, Ns):
+    def sample_features(self, ts, omegas, Ns):
         """
         for now we say that for each omega sample we also sample from the filter
         omegas = Nrff
@@ -142,28 +142,26 @@ class NPFeatures:
         # Nt x Ns (Ns = Nb x Nq)
         thets, betas, ws = self.sample_basis(Ns=Ns)
         qs = self.compute_q(thets, betas, ws)
-        Nt = ts.shape[1]  # 0 is the MC sample dim, 1 is num. points
-        Nz = z.shape[0]
 
         mI1 = I1(
-            ts[:, None, :],
+            ts[:, :, None, None],
             self.alph,
-            thets[:, :, None].repeat(1, 1, Nt),
-            betas[:, :, None].repeat(1, 1, Nt),
-            omegas[:, :, None],
+            thets[:, None, None, :],
+            betas[:, None, None, :],
+            omegas[None, None, :, None],
         )
-        random_part = (mI1 * ws[:, :, None].repeat(1, 1, Nt)).sum(
-            axis=1, keepdim=True
-        )  # TODO - keep or remove sum?
 
-        basis_part = qs[:, 0, :].unsqueeze(1) * I2(
-            ts[:, None, :], self.alph, z[0], self.p, omegas[:, :, None]
+        random_part = (mI1 * ws[:, None, None, :]).sum(axis=3)
+
+        mI2 = I2(
+            ts[:, :, None, None],
+            self.alph,
+            self.z[None, None, None, :],
+            self.p,
+            omegas[None, None, :, None],
         )
-        for i in range(1, Nz):
-            basis_part += qs[:, i, :].unsqueeze(1) * I2(
-                ts[:, None, :], self.alph, z[i], self.p, omegas[:, :, None]
-            )
 
-        return torch.exp(-self.alph * ts[:, :, None] ** 2) * (
-            random_part + basis_part
-        ).transpose(1, 2)
+        basis_part = (mI2 * qs[:, None, None, :]).sum(axis=3)
+
+        # dims are Ns x Nt x N(toms baisis)
+        return random_part + basis_part
