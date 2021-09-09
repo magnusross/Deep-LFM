@@ -93,7 +93,7 @@ dlfm.train(
     epochs=100000,
     batch_size=256,
     verbosity=10,
-    single_mc_epochs=25,
+    single_mc_epochs=0, # TODO - temporarily disabling this, can worry about it later
     train_time_limit=1,
 )
 

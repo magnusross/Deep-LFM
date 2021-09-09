@@ -10,13 +10,14 @@ mu = 1.0 * z
 LK = 0.01 * torch.eye(5, requires_grad=True)
 u_dist = MultivariateNormal(mu, scale_tril=LK)
 
+Nu = 5
 Ns = 10
 Nt = 12
 Ntom = 13
 Nmag = 14
 
 ls = torch.tensor([0.2], requires_grad=True)
-features = NPFeatures(u_dist, z, 1.0, ls, 1.0, Nmag, Ns)
+features = NPFeatures(Nu, z, 1.0, ls, 1.0, Nmag, Ns)
 
 #
 # #

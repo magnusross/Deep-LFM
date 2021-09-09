@@ -120,8 +120,7 @@ class deepLFM(torch.nn.Module):
         self.Omega_mean, self.Omega_log_var = self.init_posterior_Omega()
         self.W_mean, self.W_log_var = self.init_posterior_W()
 
-        # Initialise quantities associated with the non-parametric features at each layer,
-        # such as the set of fixed inducing inputs and variables
+        # Initialise quantities associated with the non-parametric features at each layer
         self.alph = 1.0  # TODO - fix this to specific value later?
         self.amp = 1.0
         self.Nu = 10
@@ -129,6 +128,8 @@ class deepLFM(torch.nn.Module):
             -2, 2, self.Nu
         )  # TODO - choose IP range in a better way
 
+        # TODO - starting off trying one set of features for whole model,
+        # but we could extend to per layer/dimension?
         self.theta_log_features_lengthscale = torch.log(
             torch.tensor([1.0])
         ).requires_grad_(True)
@@ -259,9 +260,7 @@ class deepLFM(torch.nn.Module):
         """
         Omega_from_q = []
         for i in range(self.n_layers):
-            z = self.z_for_Omega_fixed[i] * torch.ones(
-                self.mc, self.d_in[i], self.d_out[i]
-            )
+            z = self.z_for_Omega_fixed[i] * torch.ones(1, self.d_in[i], self.d_out[i])
             Omega_from_q.append(
                 (z * torch.exp(self.Omega_log_var[i] / 2)) + self.Omega_mean[i]
             )
@@ -318,10 +317,10 @@ class deepLFM(torch.nn.Module):
 
                     # Fetch layer values & frequencies for this input dim.
                     layer_r = self.layer[i][:, :, r]
-                    Omega_r = Omega_from_q[i][:, r, :]
+                    Omega_r = Omega_from_q[i][:, r, :].flatten()
 
-                    features[r, :, :, :] = feature_sampler.sample_features(
-                        layer_r, Omega_r, self.z, self.mc
+                    features[r, :, :, :] = self.features.sample_features(
+                        layer_r, Omega_r, self.mc
                     )
 
                 # Construct matrix of coefficients to multiply RFs by (small epsilon to avoid NaNs in backprop)
@@ -384,10 +383,10 @@ class deepLFM(torch.nn.Module):
 
                         # Fetch layer values & frequencies for this input dim.
                         layer_r = self.layer[i][:, :, r]
-                        Omega_r = Omega_from_q[i][:, r, :]
+                        Omega_r = Omega_from_q[i][:, r, :].flatten()
 
-                        features[r, :, :, :] = feature_sampler.sample_features(
-                            layer_r, Omega_r, self.z, self.mc
+                        features[r, :, :, :] = self.features.sample_features(
+                            layer_r, Omega_r, self.mc
                         )
 
                     # Construct matrix of coefficients to multiply RFs by (small epsilon to avoid NaNs in backprop)
@@ -533,8 +532,11 @@ class deepLFM(torch.nn.Module):
         opt_vars = self.W_mean + self.W_log_var
         opt_vars.append(self.output_log_var)
 
-        # TODO- optimise here or with other theta stuff? Or not at all?
-        opt_vars += self.features.u_dist.mean + self.features.u_dist.covariance_matrix
+        # TODO- optimise here or with other theta stuff?
+        opt_vars += [
+            self.features.mu,
+            self.features.log_cov,
+        ]  # TODO - optimising log_cov breaks the code, fix this!
 
         # Omega fixed
         if self.q_Omega_fixed and (not self.q_theta_fixed):
@@ -542,8 +544,7 @@ class deepLFM(torch.nn.Module):
             opt_vars.append(self.rho_out)
             opt_vars.append(self.theta_log_lengthscale_out)
 
-            opt_vars += self.theta_log_features_lengthscale
-            opt_vars.append(self.theta_log_features_lengthscale_out)
+            opt_vars += [self.theta_log_features_lengthscale]
 
         # Theta fixed
         elif self.q_theta_fixed and (not self.q_Omega_fixed):
@@ -560,8 +561,7 @@ class deepLFM(torch.nn.Module):
             opt_vars.append(self.rho_out)
             opt_vars.append(self.theta_log_lengthscale_out)
 
-            opt_vars += self.theta_log_features_lengthscale
-            opt_vars.append(self.theta_log_features_lengthscale_out)
+            opt_vars += [self.theta_log_features_lengthscale]
 
         return opt_vars
 
@@ -575,7 +575,7 @@ class deepLFM(torch.nn.Module):
         batch_size=64,
         epochs=10,
         verbosity=1,
-        single_mc_epochs=0,
+        single_mc_epochs=0,  # TODO - temporarily ignoring the case where this >0, can handle later!
         train_time_limit=None,
         ignore_nan=False,
         csv_output=False,

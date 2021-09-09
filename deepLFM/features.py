@@ -24,7 +24,6 @@ def I1(
     Returns:
         torch.Tensor: Value of the inegral.
     """
-
     const = 0.5 * torch.sqrt(pi / alph)
     t1 = torch.exp(torch.complex(-((thet + omeg) ** 2) / (4 * alph), t * omeg - beta))
     t2 = 1 + torch.exp(torch.complex(thet * omeg / alph, 2 * beta))
@@ -60,7 +59,7 @@ def I2(
 
 class NPFeatures:
     def __init__(self, Nu, z, alph, ls, amp, Nbasis, Ns):
-
+        self.Nu = Nu
         self.z = z
         self.alph = torch.tensor(alph)
         self.ls = torch.tensor(ls)
@@ -70,13 +69,14 @@ class NPFeatures:
         self.Ns = Ns
         self.set_K()
 
-        mu = (
-            torch.distributions.MultivariateNormal(torch.zeros(Nu), self.K)
+        self.mu = (
+            torch.distributions.MultivariateNormal(torch.zeros(self.Nu), self.K)
             .rsample()
             .requires_grad_(True)
         )
-        cov = (0.8 * self.K).requires_grad_(True)
-        self.u_dist = torch.distributions.MultivariateNormal(mu, cov)
+
+        self.log_cov = torch.log(0.8 * self.K).requires_grad_(True)
+        self.set_u_dist()
 
     def compute_K(self, t1s=None, t2s=None):
         if t1s is None and t2s is None:
@@ -100,6 +100,11 @@ class NPFeatures:
         K, LK = self.compute_K()
         self.K = K
         self.LK = LK
+
+    def set_u_dist(self):
+        self.u_dist = torch.distributions.MultivariateNormal(
+            self.mu, torch.exp(self.log_cov), validate_args=True
+        )
 
     def sample_basis(self, Ns=None):
         if Ns is None:
@@ -148,6 +153,7 @@ class NPFeatures:
         # Nt x Ns (Ns = Nb x Nq)
         thets, betas, ws = self.sample_basis(Ns=Ns)
         qs = self.compute_q(thets, betas, ws)
+        self.set_u_dist()
 
         mI1 = I1(
             ts[:, :, None, None],
@@ -169,5 +175,5 @@ class NPFeatures:
 
         basis_part = (mI2 * qs[:, None, None, :]).sum(axis=3)
 
-        # dims are Ns x Nt x N(toms baisis)
+        # dims are Ns x Nt x N(toms basis)
         return random_part + basis_part
