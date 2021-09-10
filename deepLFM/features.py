@@ -58,8 +58,8 @@ def I2(
 
 
 class NPFeatures:
-    def __init__(self, Nu, z, alph, ls, amp, Nbasis, Ns):
-        self.Nu = Nu
+    def __init__(self, z, alph, ls, amp, Nbasis, Ns, q_frac=0.8):
+        self.Nu = len(z)
         self.z = z
         self.alph = torch.tensor(alph)
         self.ls = ls
@@ -77,7 +77,7 @@ class NPFeatures:
             .requires_grad_(True)
         )
         self.cov_tril = torch.linalg.cholesky(
-            0.8 * self.K.detach() + JITTER * torch.eye(self.K.shape[0])
+            q_frac * self.K.detach() + JITTER * torch.eye(self.K.shape[0])
         ).requires_grad_(True)
         self.set_u_dist()
 

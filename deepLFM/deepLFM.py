@@ -78,7 +78,7 @@ class deepLFM(torch.nn.Module):
 
         # Define layer-wise sensitivity parameters for inner layers to weight contribution of each input/LF
         self.rho = [
-            torch.randn(self.d_in[i], self.n_lf[i], requires_grad=True)
+            torch.ones(self.d_in[i], self.n_lf[i], requires_grad=True)
             for i in range(self.n_hidden_layers)
         ]
 
@@ -97,7 +97,7 @@ class deepLFM(torch.nn.Module):
         ]
 
         # Output layer parameters; these can differ according to both input dimension r and output dimension d
-        self.rho_out = torch.randn(
+        self.rho_out = torch.ones(
             self.d_in[-1], self.D, self.n_lf[-1], requires_grad=True
         )
         self.theta_log_lengthscale_prior_out = np.log(1.0)
