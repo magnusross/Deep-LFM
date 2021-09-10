@@ -532,19 +532,15 @@ class deepLFM(torch.nn.Module):
         opt_vars = self.W_mean + self.W_log_var
         opt_vars.append(self.output_log_var)
 
-        # TODO- optimise here or with other theta stuff?
-        opt_vars += [
-            self.features.mu,
-            self.features.log_cov,
-        ]  # TODO - optimising log_cov breaks the code, fix this!
-
         # Omega fixed
         if self.q_Omega_fixed and (not self.q_theta_fixed):
             opt_vars += self.theta_log_lengthscale + self.rho
             opt_vars.append(self.rho_out)
             opt_vars.append(self.theta_log_lengthscale_out)
 
-            opt_vars += [self.theta_log_features_lengthscale]
+            opt_vars.append(self.theta_log_features_lengthscale)
+            opt_vars.append(self.features.mu)
+            opt_vars.append(self.features.cov_tril)
 
         # Theta fixed
         elif self.q_theta_fixed and (not self.q_Omega_fixed):
@@ -561,7 +557,9 @@ class deepLFM(torch.nn.Module):
             opt_vars.append(self.rho_out)
             opt_vars.append(self.theta_log_lengthscale_out)
 
-            opt_vars += [self.theta_log_features_lengthscale]
+            opt_vars.append(self.theta_log_features_lengthscale)
+            opt_vars.append(self.features.mu)
+            opt_vars.append(self.features.cov_tril)
 
         return opt_vars
 
@@ -642,7 +640,9 @@ class deepLFM(torch.nn.Module):
                 loss, _, _, _ = self.get_nelbo(
                     X_minibatch, y_minibatch, ignore_nan=ignore_nan
                 )
-                loss.backward()
+                loss.backward(
+                    retain_graph=True
+                )  # TODO - figure out how we can set this to False -> will speed up training
                 optimizer.step()
 
             train_time += int(round(time.time() * 1000)) - batch_start

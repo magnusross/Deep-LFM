@@ -62,7 +62,7 @@ class NPFeatures:
         self.Nu = Nu
         self.z = z
         self.alph = torch.tensor(alph)
-        self.ls = torch.tensor(ls)
+        self.ls = ls
         self.p = 1.0 / (2.0 * self.ls ** 2)
         self.amp = torch.tensor(amp)
         self.Nbasis = Nbasis
@@ -70,12 +70,15 @@ class NPFeatures:
         self.set_K()
 
         self.mu = (
-            torch.distributions.MultivariateNormal(torch.zeros(self.Nu), self.K)
+            torch.distributions.MultivariateNormal(
+                torch.zeros(self.Nu), self.K.detach()
+            )
             .rsample()
             .requires_grad_(True)
         )
-
-        self.log_cov = torch.log(0.8 * self.K).requires_grad_(True)
+        self.cov_tril = torch.linalg.cholesky(
+            0.8 * self.K.detach() + JITTER * torch.eye(self.K.shape[0])
+        ).requires_grad_(True)
         self.set_u_dist()
 
     def compute_K(self, t1s=None, t2s=None):
@@ -103,7 +106,9 @@ class NPFeatures:
 
     def set_u_dist(self):
         self.u_dist = torch.distributions.MultivariateNormal(
-            self.mu, torch.exp(self.log_cov), validate_args=True
+            self.mu,
+            scale_tril=self.cov_tril,
+            validate_args=False,  # TODO - check why this errors when validate_args=True
         )
 
     def sample_basis(self, Ns=None):
@@ -126,6 +131,7 @@ class NPFeatures:
 
     def compute_q(self, thets, betas, ws):
         phi = self.compute_Phi(thets, betas, ws)
+        self.set_u_dist()
         us = self.u_dist.rsample(sample_shape=(self.Ns,))
         rLK = self.LK.unsqueeze(0).repeat(self.Ns, 1, 1)
         x = us.unsqueeze(-1) - phi.transpose(1, 2).matmul(ws.unsqueeze(-1))
@@ -153,7 +159,6 @@ class NPFeatures:
         # Nt x Ns (Ns = Nb x Nq)
         thets, betas, ws = self.sample_basis(Ns=Ns)
         qs = self.compute_q(thets, betas, ws)
-        self.set_u_dist()
 
         mI1 = I1(
             ts[:, :, None, None],
